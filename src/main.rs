@@ -11,9 +11,8 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher};
 
 use syntect::{
-    easy::HighlightLines,
-    highlighting::ThemeSet,
-    parsing::SyntaxSet,
+    highlighting::{HighlightIterator, HighlightState, Highlighter, Style, ThemeSet},
+    parsing::{ParseState, ScopeStack, SyntaxSet},
 };
 
 use std::io::{stdout, Write};
@@ -22,7 +21,7 @@ use std::collections::HashSet;
 
 //test 
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Normal,
     Insert,
@@ -282,6 +281,156 @@ fn write_file(path: &PathBuf, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+// ── Jump to definition, via ctags ────────────────────────────────────────
+//
+// A lightweight alternative to LSP for "go to definition": ctags is a
+// single, synchronous, one-shot command — no persistent process, no
+// protocol, nothing to keep in sync. We just re-run it whenever the person
+// asks to jump, parse its plain-text symbol listing, and look up the word
+// under the cursor. It won't understand types or scoping the way a real
+// language server would (a name that's overloaded or shadowed just
+// resolves to whichever definition ctags listed first), but it's a real,
+// working jump-to-definition across the whole project with no extra
+// architecture — exactly what Vim relied on for this for decades before
+// LSP existed.
+
+/// One entry from ctags' output: a symbol name, its kind (function,
+/// struct, field, ...), and where it's defined.
+struct TagEntry {
+    name: String,
+    kind: String,
+    file: PathBuf,
+    line: usize,
+}
+
+/// Run `ctags -R -x` over `current_dir` and parse its cross-reference
+/// output. Returns an empty list (rather than erroring) if ctags isn't
+/// installed or the scan finds nothing — callers treat that as "no tags
+/// available" and say so.
+fn run_ctags(current_dir: &PathBuf) -> Vec<TagEntry> {
+    let output = std::process::Command::new("ctags")
+        .args(["-R", "-x", "--fields=+n", "."])
+        .current_dir(current_dir)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    // Each line: NAME  KIND  LINE  FILE  <source line text...>
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(kind), Some(line_str), Some(file)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(line_no) = line_str.parse::<usize>() else {
+            continue;
+        };
+        entries.push(TagEntry {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            file: current_dir.join(file),
+            line: line_no,
+        });
+    }
+
+    entries
+}
+
+/// Find the identifier the cursor is on or immediately after (unlike
+/// `word_prefix_at_cursor`, this looks both directions, so it works when
+/// the cursor is anywhere inside the word, not just at its end).
+fn word_at_cursor(line: &[char], cursor_x: usize) -> String {
+    let len = line.len();
+    if len == 0 {
+        return String::new();
+    }
+
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut at = cursor_x.min(len - 1);
+
+    if !is_word(line[at]) && at > 0 && is_word(line[at - 1]) {
+        at -= 1;
+    }
+    if !is_word(line[at]) {
+        return String::new();
+    }
+
+    let mut start = at;
+    while start > 0 && is_word(line[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end + 1 < len && is_word(line[end + 1]) {
+        end += 1;
+    }
+
+    line[start..=end].iter().collect()
+}
+
+/// `gd` — jump to the definition of the identifier under the cursor,
+/// looked up via a fresh ctags scan of `current_dir`. Opens the target
+/// file first if the definition lives somewhere else.
+fn jump_to_definition(
+    current_dir: &PathBuf,
+    word: &str,
+    mode: &mut Mode,
+    dirty: &mut bool,
+    file_path: &mut Option<PathBuf>,
+    lines: &mut Vec<Vec<char>>,
+    cursor_x: &mut usize,
+    cursor_y: &mut usize,
+    status_msg: &mut String,
+    line_states: &mut Vec<HlState>,
+) {
+    if word.is_empty() {
+        *status_msg = "gd: no identifier under the cursor.".to_string();
+        *mode = Mode::StatusMsg;
+        return;
+    }
+
+    let entries = run_ctags(current_dir);
+    if entries.is_empty() {
+        *status_msg =
+            "gd: no tags found — is 'ctags' (universal-ctags) installed?".to_string();
+        *mode = Mode::StatusMsg;
+        return;
+    }
+
+    match entries.iter().find(|e| e.name == word) {
+        Some(entry) => {
+            let target_line = entry.line.saturating_sub(1);
+            let already_open = file_path.as_ref() == Some(&entry.file);
+
+            if !already_open {
+                do_open(
+                    &entry.file, mode, dirty, file_path, lines, cursor_x, cursor_y,
+                    status_msg, line_states,
+                );
+            }
+            if target_line < lines.len() {
+                *cursor_y = target_line;
+                *cursor_x = 0;
+            }
+            *status_msg = format!(
+                "-> {} ({}) — {}:{}",
+                entry.name, entry.kind, entry.file.display(), entry.line
+            );
+            *mode = Mode::StatusMsg;
+        }
+        None => {
+            *status_msg = format!("gd: no definition found for '{}'.", word);
+            *mode = Mode::StatusMsg;
+        }
+    }
+}
+
 /// Read `dir` and return (name, is_dir) pairs, directories first, then
 /// alphabetical (case-insensitive) within each group. Unreadable or missing
 /// directories just come back empty rather than erroring.
@@ -334,6 +483,7 @@ fn do_open(
     cursor_x: &mut usize,
     cursor_y: &mut usize,
     status_msg: &mut String,
+    line_states: &mut Vec<HlState>,
 ) {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
@@ -346,6 +496,7 @@ fn do_open(
             *dirty = false;
             *file_path = Some(path.clone());
             *status_msg = format!("Opened: {}", path.display());
+            line_states.clear();
         }
         Err(e) => {
             *status_msg = format!("Error opening '{}': {}", path.display(), e);
@@ -410,6 +561,7 @@ fn do_new_file(
     cursor_x: &mut usize,
     cursor_y: &mut usize,
     status_msg: &mut String,
+    line_states: &mut Vec<HlState>,
 ) {
     let path = current_dir.join(name);
 
@@ -436,6 +588,7 @@ fn do_new_file(
             *dirty = false;
             *file_path = Some(path.clone());
             *status_msg = format!("Created and opened: {}", path.display());
+            line_states.clear();
         }
         Err(e) => {
             *status_msg = format!("Error creating file: {}", e);
@@ -533,6 +686,7 @@ fn handle_command(
     lines: &mut Vec<Vec<char>>,
     cursor_x: &mut usize,
     cursor_y: &mut usize,
+    line_states: &mut Vec<HlState>,
 ) -> CommandResult {
     // Split "cd some/dir" into ("cd", Some("some/dir")); "cd" alone -> ("cd", None).
     let mut parts = cmd.splitn(2, ' ');
@@ -568,7 +722,7 @@ fn handle_command(
                 // ":op some/file.rs" — open it directly.
                 Some(name) => {
                     let path = resolve_against(current_dir, name);
-                    do_open(&path, mode, dirty, file_path, lines, cursor_x, cursor_y, status_msg);
+                    do_open(&path, mode, dirty, file_path, lines, cursor_x, cursor_y, status_msg, line_states);
                 }
                 // ":op" alone — open the browser to pick a file.
                 None => start_browsing(
@@ -612,6 +766,7 @@ fn handle_command(
                     cursor_x,
                     cursor_y,
                     status_msg,
+                    line_states,
                 ),
                 None => {
                     new_file_prompt_buf.clear();
@@ -635,6 +790,181 @@ fn handle_command(
             CommandResult::Stay
         }
     }
+}
+
+// ── Incremental syntax highlighting ─────────────────────────────────────
+//
+// syntect's own docs describe exactly this pattern for editors: cache the
+// (ParseState, HighlightState) pair after each line, so that re-highlighting
+// after an edit only has to resume from the nearest cached point instead of
+// re-deriving state from the top of the file. `line_states[i]` holds the
+// state *after* line i has been processed; it's the starting point for
+// line i + 1. Any edit invalidates everything from the edited line onward
+// (see the call sites of `.truncate(...)` / `.clear()` in the input loop).
+
+type HlState = (ParseState, HighlightState);
+
+/// Ensure the cache covers up to and including `target`, fast-forwarding
+/// (state only, no rendering) through any earlier lines it hasn't reached
+/// yet, then return the full line's highlighted spans for `target`.
+fn highlight_line_cached(
+    line_states: &mut Vec<HlState>,
+    lines: &[Vec<char>],
+    target: usize,
+    syntax: &syntect::parsing::SyntaxReference,
+    ps: &SyntaxSet,
+    highlighter: &Highlighter,
+) -> Vec<(Style, String)> {
+    // Fast-forward: get the cache up through `target - 1` if it isn't
+    // already there. We only need the resulting state from these lines,
+    // not their rendered spans (they may not even be on screen).
+    while line_states.len() < target {
+        let idx = line_states.len();
+        let (mut parse_state, mut highlight_state) = if idx == 0 {
+            (ParseState::new(syntax), HighlightState::new(highlighter, ScopeStack::new()))
+        } else {
+            line_states[idx - 1].clone()
+        };
+        let mut text: String = lines[idx].iter().collect();
+        text.push('\n');
+        let ops = parse_state.parse_line(&text, ps).unwrap_or_default();
+        // Drain the iterator just to advance highlight_state; spans unused.
+        HighlightIterator::new(&mut highlight_state, &ops, &text, highlighter).for_each(drop);
+        line_states.push((parse_state, highlight_state));
+    }
+
+    // Now do the target line itself, starting from the (now-guaranteed)
+    // cached state for the line before it.
+    let (mut parse_state, mut highlight_state) = if target == 0 {
+        (ParseState::new(syntax), HighlightState::new(highlighter, ScopeStack::new()))
+    } else {
+        line_states[target - 1].clone()
+    };
+    let mut text: String = lines[target].iter().collect();
+    text.push('\n');
+    let ops = parse_state.parse_line(&text, ps).unwrap_or_default();
+    let mut ranges: Vec<(Style, String)> =
+        HighlightIterator::new(&mut highlight_state, &ops, &text, highlighter)
+            .map(|(style, piece)| (style, piece.to_string()))
+            .collect();
+
+    // We only appended '\n' so syntax rules that anchor on end-of-line parse
+    // correctly. It must never actually reach the terminal — printing a raw
+    // '\n' moves the cursor down mid-line, splitting the line's rendered
+    // text across two screen rows.
+    if let Some((_, last)) = ranges.last_mut() {
+        while matches!(last.chars().last(), Some('\n') | Some('\r')) {
+            last.pop();
+        }
+        if last.is_empty() {
+            ranges.pop();
+        }
+    }
+
+    if line_states.len() == target {
+        line_states.push((parse_state, highlight_state));
+    } else {
+        line_states[target] = (parse_state, highlight_state);
+    }
+
+    ranges
+}
+
+/// Given a full line's highlighted spans, keep only the portion that falls
+/// within the visible column window [start_col, start_col + width), clipping
+/// the first/last spans at the boundary as needed.
+fn clip_ranges_to_window(
+    ranges: &[(Style, String)],
+    start_col: usize,
+    width: usize,
+) -> Vec<(Style, String)> {
+    let end_col = start_col + width;
+    let mut result = Vec::new();
+    let mut col = 0usize;
+
+    for (style, piece) in ranges {
+        let piece_chars: Vec<char> = piece.chars().collect();
+        let piece_start = col;
+        let piece_end = col + piece_chars.len();
+        col = piece_end;
+
+        if piece_end <= start_col || piece_start >= end_col {
+            continue;
+        }
+        let clip_start = start_col.saturating_sub(piece_start);
+        let clip_end = (end_col.saturating_sub(piece_start)).min(piece_chars.len());
+        if clip_start < clip_end {
+            let text: String = piece_chars[clip_start..clip_end].iter().collect();
+            result.push((*style, text));
+        }
+    }
+
+    result
+}
+
+/// Draw one buffer line at a given screen row: gutter, syntax-highlighted
+/// text clipped to the horizontal scroll window, and (if it's the cursor's
+/// line) the full-width background highlight. Used by both the full-screen
+/// redraw and the partial "just this line" redraw.
+fn draw_buffer_line(
+    stdout: &mut impl Write,
+    line_states: &mut Vec<HlState>,
+    lines: &[Vec<char>],
+    buffer_line_num: usize,
+    screen_y: usize,
+    is_current_line: bool,
+    col_offset: usize,
+    text_cols: usize,
+    syntax: &syntect::parsing::SyntaxReference,
+    ps: &SyntaxSet,
+    highlighter: &Highlighter,
+) -> std::io::Result<()> {
+    let full_ranges =
+        highlight_line_cached(line_states, lines, buffer_line_num, syntax, ps, highlighter);
+    let ranges = clip_ranges_to_window(&full_ranges, col_offset, text_cols);
+
+    execute!(stdout, cursor::MoveTo(0, screen_y as u16))?;
+    print_gutter(stdout, buffer_line_num + 1, gutter_digits(lines.len()), is_current_line)?;
+
+    if is_current_line {
+        execute!(stdout, SetBackgroundColor(Color::DarkGrey))?;
+    }
+
+    let mut printed = 0usize;
+    for (style, piece) in &ranges {
+        printed += piece.chars().count();
+        let color = Color::Rgb {
+            r: style.foreground.r,
+            g: style.foreground.g,
+            b: style.foreground.b,
+        };
+        execute!(stdout, SetForegroundColor(color), Print(piece.as_str()))?;
+    }
+
+    // Always pad to the full text width — not just for the highlighted
+    // current line. Without this, a line that's redrawn standalone (e.g.
+    // it just lost the cursor highlight, or got shorter) can leave stale
+    // background color or characters behind from whatever was there before.
+    let remaining = text_cols.saturating_sub(printed);
+    if remaining > 0 {
+        execute!(stdout, Print(" ".repeat(remaining)))?;
+    }
+
+    execute!(stdout, ResetColor)?;
+    Ok(())
+}
+
+/// Draw a past-end-of-buffer marker row (Vim-style "~"), padded to the full
+/// terminal width so it correctly overwrites whatever a shorter or longer
+/// line previously left on that row.
+fn draw_tilde_row(stdout: &mut impl Write, screen_y: usize, cols: usize) -> std::io::Result<()> {
+    execute!(stdout, cursor::MoveTo(0, screen_y as u16))?;
+    execute!(stdout, SetForegroundColor(Color::DarkGrey), Print("~"))?;
+    if cols > 1 {
+        execute!(stdout, Print(" ".repeat(cols - 1)))?;
+    }
+    execute!(stdout, ResetColor)?;
+    Ok(())
 }
 
 // ── Gutter & status bar styling ─────────────────────────────────────────
@@ -845,6 +1175,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
     let ts = ThemeSet::load_defaults();
 
     let theme = &ts.themes["base16-ocean.dark"];
+    let highlighter = Highlighter::new(theme);
+    let mut line_states: Vec<HlState> = Vec::new();
 
     let mut mode = Mode::Normal;
     let mut command_buffer = String::new();
@@ -880,8 +1212,32 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
 
     // State for Insert-mode keyword autocomplete (Ctrl-N / Ctrl-P / Tab).
     let mut autocomplete_active = false;
+    // True right after 'g' is pressed in Normal mode, waiting to see if
+    // 'd' follows (the "gd" jump-to-definition sequence).
+    let mut g_pending = false;
     let mut autocomplete_suggestions: Vec<String> = Vec::new();
     let mut autocomplete_selected: usize = 0;
+
+    // Snapshot of what the last frame actually rendered. If none of this
+    // has changed except which line the cursor is on, we only need to
+    // repaint the line(s) involved instead of the whole screen.
+    let mut has_rendered_once = false;
+    let mut prev_mode = mode;
+    let mut prev_cursor_y: usize = 0;
+    let mut prev_row_offset: usize = 0;
+    let mut prev_col_offset: usize = 0;
+    let mut prev_line_count: usize = 0;
+    let mut prev_autocomplete_active = false;
+    let mut prev_rows_usize: usize = 0;
+    let mut prev_cols_usize: usize = 0;
+    // If the whole buffer was swapped out from under us (open/create a
+    // different file), the identity check below catches it even if the
+    // new file coincidentally has the same line count as the old one.
+    let mut prev_file_path: Option<PathBuf> = None;
+    // Set by any edit that changes the line count, to the lowest buffer
+    // line index affected — lets the render step redraw just from there
+    // down to the bottom of the screen instead of doing a full repaint.
+    let mut min_dirty_line: Option<usize> = None;
 
     'editor: loop {
         let (_cols, rows) = terminal::size()?;
@@ -927,81 +1283,151 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
         } else {
         execute!(stdout, cursor::Hide)?;
 
-        execute!(stdout, terminal::Clear(ClearType::All))?;
+        let syntax = if let Some(path) = &file_path {
+            path.extension()
+                .and_then(|s| s.to_str())
+                .and_then(|ext| ps.find_syntax_by_extension(ext))
+                .unwrap_or_else(|| ps.find_syntax_plain_text())
+        } else {
+            ps.find_syntax_plain_text()
+        };
 
+        // Only safe to avoid a full repaint if literally everything else
+        // that could change what's on screen — terminal size, which file
+        // is open, horizontal scroll, the autocomplete popup — is
+        // identical to what the last frame actually drew. Mode itself
+        // (Normal/Insert/Command/prompts) doesn't matter: none of them
+        // change how the buffer area looks, only the status bar, which is
+        // always redrawn below regardless. The one mode that *does* replace
+        // the whole screen, DirBrowse, is handled by the branch above, so
+        // we only need to check the *previous* frame wasn't that.
+        let base_safe = has_rendered_once
+            && prev_mode != Mode::DirBrowse
+            && file_path == prev_file_path
+            && col_offset == prev_col_offset
+            && rows_usize == prev_rows_usize
+            && cols_usize == prev_cols_usize
+            && !autocomplete_active
+            && !prev_autocomplete_active;
 
-        for (screen_y, line) in lines
-            .iter()
-            .skip(row_offset)
-            .take(rows_usize.saturating_sub(1))
-            .enumerate() {
-                if screen_y >= rows_usize.saturating_sub(1) {
-                    break;
+        let row_delta = row_offset as i64 - prev_row_offset as i64;
+        let visible_rows = rows_usize.saturating_sub(1);
+        let structural_change = lines.len() != prev_line_count;
+
+        if base_safe && !structural_change && row_delta == 0 {
+            let mut redraw = [prev_cursor_y, cursor_y];
+            redraw.sort_unstable();
+            for line_num in redraw {
+                if line_num >= row_offset
+                    && line_num < row_offset + rows_usize.saturating_sub(1)
+                    && line_num < lines.len()
+                {
+                    let screen_y = line_num - row_offset;
+                    draw_buffer_line(
+                        stdout, &mut line_states, &lines, line_num, screen_y,
+                        line_num == cursor_y, col_offset, text_cols, syntax, &ps, &highlighter,
+                    )?;
                 }
-
-                let buffer_line_num = screen_y + row_offset;
-                let is_current_line = buffer_line_num == cursor_y;
-
-                let full_text: String = line.iter().collect();
-                let visible_text: String = full_text
-                    .chars()
-                    .skip(col_offset)
-                    .take(text_cols)
-                    .collect();
-
-                let syntax = if let Some(path) = &file_path {
-                    path.extension()
-                        .and_then(|s| s.to_str())
-                        .and_then(|ext| ps.find_syntax_by_extension(ext))
-                        .unwrap_or_else(|| ps.find_syntax_plain_text())
-                } else {
-                ps.find_syntax_plain_text()
-            };
-
-            let mut h = HighlightLines::new(syntax, theme);
-
-            let ranges = h.highlight_line(&visible_text, &ps).unwrap_or_default();
-
-            execute!(stdout, cursor::MoveTo(0, screen_y as u16))?;
-            print_gutter(stdout, buffer_line_num + 1, gutter_digits(lines.len()), is_current_line)?;
-
-            // Subtle full-width highlight on the line the cursor is on.
-            if is_current_line {
-                execute!(stdout, SetBackgroundColor(Color::DarkGrey))?;
             }
+        } else if base_safe && !structural_change && row_delta.abs() == 1 && visible_rows > 0 {
+            // Let the terminal itself shift the existing rows, restricted to
+            // the text area so the status bar row is left alone. This avoids
+            // retransmitting every visible line just to move the viewport
+            // by one row.
+            write!(stdout, "\x1b[1;{}r", visible_rows)?;
+            if row_delta > 0 {
+                execute!(stdout, terminal::ScrollUp(1))?;
+            } else {
+                execute!(stdout, terminal::ScrollDown(1))?;
+            }
+            // Restore the full-screen scroll region immediately — every
+            // draw from here on repositions the cursor explicitly anyway.
+            write!(stdout, "\x1b[1;{}r", rows_usize)?;
 
-            for(style, piece) in ranges {
-                let color = Color::Rgb {
-                    r: style.foreground.r,
-                    g: style.foreground.g,
-                    b: style.foreground.b,
-                };
-
-                execute!(
-                    stdout,
-                    SetForegroundColor(color),
-                    Print(piece)
+            // The old cursor line shifted to a new row along with the
+            // scroll; redraw it there so its now-stale highlight clears.
+            if prev_cursor_y != cursor_y
+                && prev_cursor_y >= row_offset
+                && prev_cursor_y < row_offset + visible_rows
+            {
+                let screen_y = prev_cursor_y - row_offset;
+                draw_buffer_line(
+                    stdout, &mut line_states, &lines, prev_cursor_y, screen_y,
+                    false, col_offset, text_cols, syntax, &ps, &highlighter,
                 )?;
             }
 
-            if is_current_line {
-                // Pad out to the edge of the text area so the highlight
-                // covers the whole line, not just where the text ends.
-                let printed = visible_text.chars().count();
-                let remaining = text_cols.saturating_sub(printed);
-                if remaining > 0 {
-                    execute!(stdout, Print(" ".repeat(remaining)))?;
-                }
+            // The one line the scroll actually revealed.
+            let revealed = if row_delta > 0 {
+                row_offset + visible_rows - 1
+            } else {
+                row_offset
+            };
+            if revealed < lines.len() {
+                let screen_y = revealed - row_offset;
+                draw_buffer_line(
+                    stdout, &mut line_states, &lines, revealed, screen_y,
+                    revealed == cursor_y, col_offset, text_cols, syntax, &ps, &highlighter,
+                )?;
+            } else if revealed >= row_offset && revealed < row_offset + visible_rows {
+                draw_tilde_row(stdout, revealed - row_offset, cols_usize)?;
             }
 
-            execute!(stdout, ResetColor)?;
+            // Cover the (rare) case where the cursor's line wasn't either
+            // of the two lines above.
+            if cursor_y != revealed
+                && cursor_y != prev_cursor_y
+                && cursor_y >= row_offset
+                && cursor_y < row_offset + visible_rows
+            {
+                let screen_y = cursor_y - row_offset;
+                draw_buffer_line(
+                    stdout, &mut line_states, &lines, cursor_y, screen_y,
+                    true, col_offset, text_cols, syntax, &ps, &highlighter,
+                )?;
+            }
+        } else if base_safe && structural_change && row_delta == 0 && min_dirty_line.is_some() {
+            // A line was inserted or removed (Enter, Backspace-merge, `o`),
+            // which shifts everything below the edit point down or up by
+            // one — but nothing *above* the edit point changed at all. So
+            // skip the Clear and only redraw from the edit point down to
+            // the bottom of the screen.
+            let edit_line = min_dirty_line.unwrap();
+            let start_row = edit_line.saturating_sub(row_offset);
+            for screen_y in start_row..visible_rows {
+                let buffer_line_num = screen_y + row_offset;
+                if buffer_line_num < lines.len() {
+                    draw_buffer_line(
+                        stdout, &mut line_states, &lines, buffer_line_num, screen_y,
+                        buffer_line_num == cursor_y, col_offset, text_cols, syntax, &ps, &highlighter,
+                    )?;
+                } else {
+                    draw_tilde_row(stdout, screen_y, cols_usize)?;
+                }
+            }
+        } else {
+        execute!(stdout, terminal::Clear(ClearType::All))?;
+
+
+        for screen_y in 0..rows_usize.saturating_sub(1) {
+                let buffer_line_num = screen_y + row_offset;
+                if buffer_line_num >= lines.len() {
+                    break;
+                }
+
+                let is_current_line = buffer_line_num == cursor_y;
+
+            draw_buffer_line(
+                stdout, &mut line_states, &lines, buffer_line_num, screen_y,
+                is_current_line, col_offset, text_cols, syntax, &ps, &highlighter,
+            )?;
         }
 
         // Tilde rows past the end of the buffer, like Vim's empty-line marker.
         let printed_rows = lines.len().saturating_sub(row_offset).min(rows_usize.saturating_sub(1));
         for r in printed_rows..rows_usize.saturating_sub(1) {
-            execute!(stdout, cursor::MoveTo(0, r as u16))?;
-            execute!(stdout, SetForegroundColor(Color::DarkGrey), Print("~"), ResetColor)?;
+            draw_tilde_row(stdout, r, cols_usize)?;
+        }
         }
 
         if mode == Mode::Insert && autocomplete_active {
@@ -1125,11 +1551,37 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
         stdout.flush()?;
         } // end else (normal buffer render)
 
+        has_rendered_once = true;
+        prev_mode = mode;
+        prev_cursor_y = cursor_y;
+        prev_row_offset = row_offset;
+        prev_col_offset = col_offset;
+        prev_line_count = lines.len();
+        prev_autocomplete_active = autocomplete_active;
+        prev_rows_usize = rows_usize;
+        prev_cols_usize = cols_usize;
+        prev_file_path = file_path.clone();
+        min_dirty_line = None;
+
         // ── Input ────────────────────────────────────────────────────────────
         if let Event::Key(KeyEvent { code, modifiers, kind, .. }) = event::read()? {
             if kind != KeyEventKind::Press {
                 continue;
             }
+
+            // Many terminals (QTerminal/LXQt among them, depending on the
+            // `stty erase` setting) send the physical Backspace key as the
+            // raw byte 0x08 (ASCII BS) instead of 0x7F (DEL). That byte is
+            // bit-for-bit identical to Ctrl+H, so depending on how the
+            // terminal library parses it, it can arrive here as Char('h')
+            // with Control held rather than as KeyCode::Backspace. Treat
+            // that combination as Backspace everywhere, rather than patching
+            // every mode's key handling individually.
+            let code = if code == KeyCode::Char('h') && modifiers == KeyModifiers::CONTROL {
+                KeyCode::Backspace
+            } else {
+                code
+            };
 
             if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
                 break 'editor;
@@ -1143,7 +1595,19 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
 
             match mode {
                 // ── NORMAL ───────────────────────────────────────────────────
-                Mode::Normal => match code {
+                Mode::Normal => if g_pending {
+                    g_pending = false;
+                    if code == KeyCode::Char('d') {
+                        let word = word_at_cursor(&lines[cursor_y], cursor_x);
+                        jump_to_definition(
+                            &current_dir, &word, &mut mode, &mut dirty, &mut file_path,
+                            &mut lines, &mut cursor_x, &mut cursor_y, &mut status_msg,
+                            &mut line_states,
+                        );
+                    }
+                } else if code == KeyCode::Char('g') {
+                    g_pending = true;
+                } else { match code {
                     KeyCode::Char('i') => mode = Mode::Insert,
                     KeyCode::Char('a') => {
                         if cursor_x < lines[cursor_y].len() {
@@ -1156,6 +1620,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                         lines.insert(cursor_y, Vec::new());
                         cursor_x = 0;
                         mode = Mode::Insert;
+                        line_states.truncate(cursor_y);
+                        min_dirty_line = Some(cursor_y);
                     }
                     KeyCode::Char(':') => {
                         mode = Mode::Command;
@@ -1189,6 +1655,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                             if cursor_x > 0 && cursor_x >= line.len() {
                                 cursor_x = line.len().saturating_sub(1);
                             }
+                            line_states.truncate(cursor_y);
+                            min_dirty_line = Some(cursor_y);
                         }
                     }
                     KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1219,7 +1687,7 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                         }
                     }
                     _ => {}
-                },
+                }},
 
                 // ── INSERT ───────────────────────────────────────────────────
                 Mode::Insert => match code {
@@ -1234,11 +1702,14 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                     }
                     KeyCode::Enter => {
                         autocomplete_active = false;
+                        let edit_line = cursor_y;
                         let tail: Vec<char> = lines[cursor_y].drain(cursor_x..).collect();
                         cursor_y += 1;
                         lines.insert(cursor_y, tail);
                         cursor_x = 0;
                         dirty = true;
+                        line_states.truncate(edit_line);
+                        min_dirty_line = Some(edit_line);
                     }
                     KeyCode::Backspace => {
                         if cursor_x > 0 {
@@ -1261,6 +1732,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                             lines[cursor_y].extend(current);
                             dirty = true;
                         }
+                        line_states.truncate(cursor_y);
+                        min_dirty_line = Some(cursor_y);
                         if autocomplete_active {
                             let (_, prefix) = word_prefix_at_cursor(&lines[cursor_y], cursor_x);
                             autocomplete_suggestions =
@@ -1339,6 +1812,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                             }
                             dirty = true;
                         }
+                        line_states.truncate(cursor_y);
+                        min_dirty_line = Some(cursor_y);
                     }
                     // Auto-close brackets/quotes (VSCode-style):
                     //   - typing an opener inserts the matching closer too,
@@ -1365,6 +1840,8 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                             cursor_x += 1;
                             dirty = true;
                         }
+                        line_states.truncate(cursor_y);
+                        min_dirty_line = Some(cursor_y);
                         if autocomplete_active {
                             let (_, prefix) = word_prefix_at_cursor(&lines[cursor_y], cursor_x);
                             autocomplete_suggestions =
@@ -1406,6 +1883,7 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                             &mut lines,
                             &mut cursor_x,
                             &mut cursor_y,
+                            &mut line_states,
                         );
                         if let CommandResult::Quit = result {
                             break 'editor;
@@ -1473,6 +1951,7 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                                 &mut cursor_x,
                                 &mut cursor_y,
                                 &mut status_msg,
+                                &mut line_states,
                             );
                         }
                     }
@@ -1538,6 +2017,7 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                                     &mut cursor_x,
                                     &mut cursor_y,
                                     &mut status_msg,
+                                    &mut line_states,
                                 );
                             }
                         }
@@ -1600,6 +2080,7 @@ fn run(stdout: &mut impl Write) -> std::io::Result<()> {
                                 &mut cursor_x,
                                 &mut cursor_y,
                                 &mut status_msg,
+                                &mut line_states,
                             );
                         }
                     }
